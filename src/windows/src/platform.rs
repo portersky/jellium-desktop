@@ -22,8 +22,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use jfn_mpv::api::{
-    jfn_mpv_set_fullscreen, jfn_mpv_set_window_maximized, jfn_mpv_set_window_minimized,
-    jfn_mpv_toggle_fullscreen,
+    jfn_mpv_get_property_int, jfn_mpv_set_fullscreen, jfn_mpv_set_window_maximized,
+    jfn_mpv_set_window_minimized, jfn_mpv_toggle_fullscreen,
 };
 use jfn_mpv::boot::jfn_mpv_handle_get;
 use jfn_platform_abi::geometry::{Bounds, WindowGeometry, clamp_to_bounds};
@@ -196,11 +196,38 @@ unsafe extern "system" fn mpv_wndproc_hook(n_code: c_int, wp: WPARAM, lp: LPARAM
 
 pub(crate) fn win_early_init() {}
 
+/// Blocks until mpv's VO reports a `window-id`, or the deadline passes.
+///
+/// Platform init runs before the boot pump drains any mpv events, so the
+/// observed `window-id` cache that [`win_ensure_hwnd`] reads is still empty
+/// here. Read the property directly instead (mirrors the macOS backend's
+/// bounded wait for mpv's NSWindow). Only called from `win_init`; the sync
+/// read may serialize against the mpv core while it builds the VO, which is
+/// exactly what we want to wait on at this point.
+fn win_wait_for_hwnd(timeout: std::time::Duration) -> Option<HWND> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(hwnd) = win_ensure_hwnd() {
+            return Some(hwnd);
+        }
+        let mut raw: i64 = 0;
+        let rc = unsafe { jfn_mpv_get_property_int(c"window-id".as_ptr(), &mut raw) };
+        if rc >= 0 && raw != 0 {
+            STATE.lock().mpv_hwnd_raw = raw as usize;
+            return Some(hwnd_from_raw(raw as usize));
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
 pub(crate) fn win_init(_mpv: *mut c_void) -> Result<(), jfn_platform_abi::PlatformInitError> {
-    let Some(hwnd) = win_ensure_hwnd() else {
+    let Some(hwnd) = win_wait_for_hwnd(std::time::Duration::from_secs(5)) else {
         return Err(jfn_platform_abi::PlatformInitError::backend(
             "Windows window acquisition",
-            "no observed mpv window-id",
+            "mpv did not report a window-id before deadline",
         ));
     };
     let hwnd_raw = hwnd.0 as usize;
